@@ -89,6 +89,9 @@ public final class Tint extends Service {
     private final Runnable amazonCheck = this::amazonStillUp;
     /** dumbtv home's last answer: the panel replaces Amazon's here. */
     private volatile boolean panelOn;
+    /** The rest of home's last yes, for a press the panel opens before home answers it. */
+    private String lastFrom, lastIdlePause;
+    private int lastIdleMinutes;
 
     private final BroadcastReceiver quickReceiver = new BroadcastReceiver() {
         @Override
@@ -360,7 +363,12 @@ public final class Tint extends Service {
                             ui.post(() -> backlight.source(nowHdmi));
                         }
                     } else if (LogLines.settingsKey(line)) {
-                        ui.post(this::onSettingsKey);
+                        final long seen = SystemClock.uptimeMillis();
+                        ui.post(() -> {
+                            long wait = SystemClock.uptimeMillis() - seen;
+                            if (wait > 50) Log.i(TAG, "cog: main thread took " + wait + " ms to take the press");
+                            onSettingsKey();
+                        });
                     } else if (LogLines.longHome(line)) {
                         // Here, not on the main thread: Amazon reads its lock moments after this
                         // line, and the main thread may be busy drawing the panel.
@@ -404,24 +412,44 @@ public final class Tint extends Service {
             return;
         }
 
+        // Home's answer can wait seconds in the broadcast queue behind Amazon's own broadcasts
+        // (right after HOME, PACKAGE_RECENCY_NOTIFICATION cold-starts com.amazon.aca and the
+        // queue waits on it). With the last answer a yes, open now and let the answer correct it.
+        final boolean early = panelOn && panel != null;
+        if (early) {
+            cogAt = now;
+            panel.pressAt = now;
+            int accent = prefs(this).getInt(Panel.ACCENT, 0xFF3D8BFF);
+            show(accent, lastFrom, lastIdlePause, lastIdleMinutes);
+            if (AmazonQs.up() && AmazonQs.changedAt() >= now) amazonUnder();
+        }
+
         askHome(false, (ok, res) -> {
+            Log.i(TAG, "cog: home answered " + (ok ? "yes" : "no") + " "
+                    + (SystemClock.uptimeMillis() - now) + " ms after the press"
+                    + (early ? " (panel opened from the last answer)" : ""));
             if (ok) {
                 cogAt = now;
                 panelOn = true;
                 applyLock();
                 int accent = res != null ? res.getInt("accent", 0xFF3D8BFF) : 0xFF3D8BFF;
-                String from = res != null ? res.getString("from") : null;
-                String idlePause = res != null ? res.getString("idle_pause") : null;
-                int idleMin = res != null ? res.getInt("idle_minutes", 0) : 0;
-                show(accent, from, idlePause, idleMin);
+                remember(res);
+                if (early) {
+                    if (panel != null) panel.retarget(accent, lastFrom, lastIdlePause, lastIdleMinutes);
+                } else {
+                    if (panel != null) panel.pressAt = now;
+                    show(accent, lastFrom, lastIdlePause, lastIdleMinutes);
+                }
                 // Amazon's overlay can have started before the answer came.
                 if (AmazonQs.up() && AmazonQs.changedAt() >= now) amazonUnder();
             } else if (!isHomeInstalled(this)) {
                 cogAt = now;
                 panelOn = true;
                 applyLock();
-                show(null);
+                if (!early) show(null);
             } else {
+                // Opened from a stale yes (child lock or the panel switched off since): take it back.
+                if (early && panel != null && panel.isShowing()) panel.close();
                 // Switched off, child lock, or Guard not running: Amazon's panel, as without us.
                 // The log line is the key going down and Amazon acts on it coming up, so this
                 // press usually reaches Amazon already; nothing outside Amazon can open its
@@ -526,6 +554,7 @@ public final class Tint extends Service {
     /** Asks dumbtv home again whether the panel replaces Amazon's, and sets the lock to match. */
     private void syncLock() {
         askHome(true, (ok, res) -> {
+            if (ok) remember(res);
             panelOn = ok || !isHomeInstalled(this);
             applyLock();
         });
@@ -541,6 +570,13 @@ public final class Tint extends Service {
         AmazonQs.lock(this, panelOn && !AmazonQs.up());
     }
 
+    /** Keeps the parts of home's yes that a press opened before its answer needs. */
+    private void remember(Bundle res) {
+        lastFrom = res != null ? res.getString("from") : null;
+        lastIdlePause = res != null ? res.getString("idle_pause") : null;
+        lastIdleMinutes = res != null ? res.getInt("idle_minutes", 0) : 0;
+    }
+
     private interface Answer {
         void on(boolean ok, Bundle res);
     }
@@ -552,6 +588,8 @@ public final class Tint extends Service {
     private void askHome(boolean query, Answer answer) {
         Intent i = new Intent(ACTION_SETTINGS_KEY).setPackage("tv.dumbtv.home");
         if (query) i.putExtra("query", true);
+        // The foreground queue: the background one waits on every cold-starting receiver ahead.
+        i.addFlags(Intent.FLAG_RECEIVER_FOREGROUND);
         sendOrderedBroadcast(i, null, new BroadcastReceiver() {
             @Override
             public void onReceive(Context context, Intent intent) {

@@ -107,6 +107,8 @@ public final class Panel {
 
     private int accent = DEFAULT_ACCENT;
     private boolean fromHome, showing, closing;
+    /** uptimeMillis of the cog press this opening is for, 0 when none: logs the first frame. */
+    long pressAt;
     private View activeShield;
     private Bitmap activeShieldBmp;
 
@@ -203,12 +205,14 @@ public final class Panel {
             try {
                 wm.addView(root, lp);
                 showing = true;
+                logFirstFrame();
             } catch (RuntimeException e) {
                 Log.w(Tint.TAG, "quick settings: could not add overlay window", e);
                 showing = false;
                 return;
             }
         }
+        pressAt = 0;
 
         initBluetooth();
         refreshBluetoothDevices();
@@ -228,6 +232,41 @@ public final class Panel {
         }
 
         slide(true);
+    }
+
+    /**
+     * Home's answer for a press the panel already opened for, from the answer before it: puts the
+     * accent and the home-only rows right without sliding in again. Nothing once it is closing.
+     */
+    public void retarget(int newAccent, String from, String idlePauseStr, int idleMin) {
+        if (!isShowing()) return;
+        int a = newAccent | 0xFF000000;
+        boolean home = "home".equals(from);
+        if (a == accent && home == fromHome && idleMin == idleMinutes) return;
+        accent = a;
+        fromHome = home;
+        idleMinutes = idleMin;
+        // A row the user already stepped keeps their choice.
+        if (idlePauseResult == null) initIdlePauseMode(idlePauseStr);
+        Tint.prefs(context).edit().putInt(ACCENT, accent).apply();
+        applyAccent();
+        updateRowsVisibility();
+        refresh();
+    }
+
+    /** Logs how long after the cog press the panel's first frame started drawing. */
+    private void logFirstFrame() {
+        final long at = pressAt;
+        pressAt = 0;
+        if (at <= 0) return;
+        root.getViewTreeObserver().addOnPreDrawListener(new ViewTreeObserver.OnPreDrawListener() {
+            @Override
+            public boolean onPreDraw() {
+                root.getViewTreeObserver().removeOnPreDrawListener(this);
+                Log.i(Tint.TAG, "cog: first frame " + (SystemClock.uptimeMillis() - at) + " ms after the press");
+                return true;
+            }
+        });
     }
 
     /**
